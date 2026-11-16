@@ -21,7 +21,16 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import cv2
 import shutil
+import warnings
 from typing import Generator, List, Tuple
+
+# gradio 6.14 reads starlette's old name for HTTP 422 on every queued event, and
+# starlette >= 0.48 warns about it (same value, renamed per RFC 9110). gradio
+# 6.20+ uses the new name but requires huggingface-hub >= 1.2, which the pinned
+# sd-scripts stack (transformers < 5) cannot use - so only this warning is muted.
+warnings.filterwarnings(
+    "ignore", message=r"'HTTP_422_UNPROCESSABLE_ENTITY' is deprecated", module=r"gradio\.routes"
+)
 
 from dataset_tools import (
     CHARACTER_FLOOR_DEFAULT, FILTERED_DIR, QUALITY_FLOORS, QUALITY_LABELS,
