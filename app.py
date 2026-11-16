@@ -16,13 +16,20 @@ from PIL import Image
 import torch
 import numpy as np
 import onnxruntime as rt
-import pandas as pd
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import cv2
 import shutil
 from typing import Generator, List, Tuple
+
+from dataset_tools import (
+    CHARACTER_FLOOR_DEFAULT, FILTERED_DIR, QUALITY_FLOORS, QUALITY_LABELS,
+    AestheticScorer, DbTagger, ScoreCache, TagBlacklist,
+    collect_training_entries, join_caption, list_images, model_fingerprint,
+    move_out_of_dataset, percentile_to_label, refresh_disk_caches, restore_moved,
+    write_caption_metadata,
+)
 
 CSS = """
 .gradio-container {
@@ -113,7 +120,10 @@ STALL_WARN_SECONDS = 90
 
 
 ROOT = Path(__file__).resolve().parent
-PORTABLE_PYTHON = ROOT / "python_embeded" / "python.exe"
+# The trainer runs on the interpreter that runs the UI: the uv-managed .venv by
+# default (start_trainer.bat -> `uv run app.py`), or python_embeded\python.exe
+# when the portable build is used instead.
+PYTHON_EXE = Path(sys.executable)
 
 TRAIN_BASE = ROOT / "training"
 OUTPUT_BASE = TRAIN_BASE / "output"
@@ -126,20 +136,40 @@ for d in [TRAIN_BASE, OUTPUT_BASE]:
     d.mkdir(parents=True, exist_ok=True)
 
 
+QUALITY_MODE_OFF = "Off"
+QUALITY_MODE_IGNORE = "Ignore them in training"
+QUALITY_MODE_MOVE = "Move them out of the dataset"
+QUALITY_MODES = [QUALITY_MODE_OFF, QUALITY_MODE_IGNORE, QUALITY_MODE_MOVE]
+
+# Anima model card: "For a rank 32 LoRA, start with 2e-5 and adjust up or down
+# from there." The default LR (AdamW8bit), and the one the UI restores when
+# switching back from Prodigy to an AdamW optimizer.
+ADAMW_DEFAULT_LR = "0.00002"
+# The rest of that reference recipe (the diffusion-pipe example config of the
+# model's author): betas (0.9, 0.99), weight decay 0.01, 100 warmup steps, then
+# a constant LR - no decay.
+ADAMW_WARMUP_STEPS = 100
+
+# Key order = order of the components in the UI (see SETTINGS_COMPONENTS).
 DEFAULT_SETTINGS = {
     "trigger_word": "",
     "dataset_path": "",
-    "dit_path": str(ROOT / "models" / "anima" / "dit" / "anima-preview.safetensors"),
+    # Anima-Base is the version the model card says LoRAs should be trained on
+    # (the previews are superseded; same 28-block architecture).
+    "dit_path": str(ROOT / "models" / "anima" / "dit" / "anima-base-v1.0.safetensors"),
     "qwen_path": str(ROOT / "models" / "anima" / "text_encoder" / "qwen_3_06b_base.safetensors"),
     "vae_path": str(ROOT / "models" / "anima" / "vae" / "qwen_image_vae.safetensors"),
     "network_rank": 32,
-    "learning_rate": "1.0", # Prodigy default
-    "optimizer": "Prodigy", # Prodigy default
+    # A light touch on the base model, as the Anima model card asks; Prodigy
+    # (LR 1.0, picks its own step size) is still in the dropdown.
+    "learning_rate": ADAMW_DEFAULT_LR,
+    "optimizer": "AdamW8bit",
     "training_steps": 2400,
     "save_steps": 300,
     "sample_steps": 300,
     "pos_prompt": "",
-    "neg_prompt": "worst quality, low quality, score_1, score_2, score_3, artist name",
+    # Negative prompt recommended by the Anima model card
+    "neg_prompt": "worst quality, low quality, score_1, score_2, score_3, artist name, blurry, jpeg artifacts, chromatic aberration",
     "width": 1024,
     "height": 1024,
     "sample_steps_gen": 30,
@@ -150,9 +180,14 @@ DEFAULT_SETTINGS = {
     "gradient_accumulation_steps": 1,
     "side_min": 512,
     "side_max": 768,
-    "tagger_gen_thresh": 0.35,
-    "tagger_char_thresh": 0.85,
-    "tagger_overwrite": False
+    # dbv4 tagger: floors on top of the per-tag calibrated thresholds
+    "tagger_gen_floor": 0.0,
+    "tagger_char_floor": CHARACTER_FLOOR_DEFAULT,
+    "tagger_blacklist": "",
+    "tagger_add_safety": True,
+    "tagger_overwrite": False,
+    "quality_keep": list(QUALITY_LABELS),
+    "quality_mode": QUALITY_MODE_OFF,
 }
 def load_settings():
     settings = DEFAULT_SETTINGS.copy()
@@ -175,7 +210,7 @@ def auto_save_state(*args):
 
 
 HIDDEN_SETTINGS = {
-    "lr_scheduler": "cosine",
+    # (the LR scheduler depends on the optimizer: see create_training_toml)
     "mixed_precision": "bf16",
     "save_precision": "bf16",
     "gradient_checkpointing": True,
@@ -199,27 +234,20 @@ HIDDEN_SETTINGS = {
     "vae_batch_size": 1,
     "blocks_to_swap": 0,
     "sigmoid_scale": 1.3,
+    # Anima model card: "Don't train the LLM adapter" - it has an outsized
+    # influence on the output and is easy to degrade. sd-scripts' default is
+    # already off; spelled out so a future default change cannot flip it.
+    "network_args": ["train_llm_adapter=False"],
+    "caption_dropout_rate": 0.05,
 }
 
 
-def analyze_dataset_resolution(dataset_path: str) -> Tuple[int, int]:
-    path = Path(dataset_path)
-    if not path.exists(): return 512, 768
+def analyze_dataset_resolution(sizes: List[Tuple[int, int]]) -> Tuple[int, int]:
+    """Training resolution from the sizes of the images that will be trained."""
+    if not sizes: return 512, 768
 
-    valid_exts = {'.png', '.jpg', '.jpeg', '.webp'}
-    image_files = [f for f in path.glob('*') if f.is_file() and f.suffix.lower() in valid_exts]
-    if not image_files: return 512, 768
-
-    max_area = 0
-    max_side = 0
-
-    for img_path in image_files:
-        try:
-            with Image.open(img_path) as img:
-                w, h = img.size
-                max_area = max(max_area, w * h)
-                max_side = max(max_side, w, h)
-        except Exception: continue
+    max_area = max(w * h for w, h in sizes)
+    max_side = max(max(w, h) for w, h in sizes)
 
     # Calculate the side of the square that covers the area of the largest bucket
     # If the largest is 512x768, this yields 640.
@@ -244,37 +272,36 @@ def create_sample_prompts(project_name, trigger_word, pos_prompt, neg_prompt, wi
     with open(prompt_path, "w", encoding="utf-8") as f: f.write(prompt_str)
     return str(prompt_path)
 
-def create_dataset_toml(project_name, dataset_path, trigger_word, base_res, max_bucket, out_dir, max_steps, batch_size, grad_acc):
+def create_dataset_toml(project_name, dataset_path, metadata_path, num_images, base_res, max_bucket, out_dir, max_steps, batch_size, grad_acc):
     config_path = out_dir / f"{project_name}_dataset.toml"
-    prefix = f"{trigger_word.strip()}, " if trigger_word.strip() else None
 
-    path = Path(dataset_path)
-    valid_exts = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
-    num_images = len([f for f in path.glob('*') if f.is_file() and f.suffix.lower() in valid_exts])
-
-    if num_images == 0: num_images = 1
-
+    num_images = max(1, int(num_images))
     effective_batch = int(batch_size) * int(grad_acc)
     calculated_repeats = (int(max_steps) * effective_batch) / num_images
     final_repeats = max(1, math.ceil(calculated_repeats))
 
+    # A fine-tuning style subset (metadata_file) instead of image_dir + .txt:
+    # sd-scripts then trains exactly the images listed there, with the caption
+    # written there. The old `caption_prefix` was how the trigger word got in,
+    # but with cache_text_encoder_outputs sd-scripts encodes the raw .txt and
+    # never applies the prefix - the trigger word was never trained.
     dataset_config = {
         "general": {
-            "enable_bucket": True, 
-            "min_bucket_reso": 256, 
-            "max_bucket_reso": max_bucket, 
-            "bucket_reso_steps": 64, 
+            "enable_bucket": True,
+            "min_bucket_reso": 256,
+            "max_bucket_reso": max_bucket,
+            "bucket_reso_steps": 64,
             "bucket_no_upscale": True
         },
         "datasets": [{
-            "resolution": base_res, 
+            "resolution": base_res,
             "subsets": [{
-                "image_dir": Path(dataset_path).resolve().as_posix(), 
-                "caption_extension": ".txt", 
+                "metadata_file": Path(metadata_path).resolve().as_posix(),
+                "image_dir": Path(dataset_path).resolve().as_posix(),
+                # joins the metadata "caption" (trigger) and "tags"
+                "caption_separator": ", ",
                 "num_repeats": final_repeats,
-                "caption_prefix": prefix, 
-                "keep_tokens": 1, 
-                "caption_dropout_rate": 0.05
+                "caption_dropout_rate": HIDDEN_SETTINGS["caption_dropout_rate"],
             }]
         }]
     }
@@ -288,18 +315,23 @@ def create_training_toml(project_name, config_save_dir, actual_output_dir, rank,
     network_rank = int(rank)
     network_alpha = network_rank
     
-    opt_args = ["weight_decay=0.01"]
+    warmup_steps = 0
     if optimizer == "Prodigy":
         scheduler = "constant"
         opt_args = ["decouple=True", "weight_decay=0.01", "d_coef=1.0", "use_bias_correction=True", "safeguard_warmup=True", "betas=0.9,0.99"]
     else:
-        scheduler = "cosine"
+        # Anima's reference AdamW recipe (see ADAMW_WARMUP_STEPS). The 2e-5 of
+        # the model card is a constant LR: a cosine decay would halve it on average.
+        scheduler = "constant_with_warmup"
+        opt_args = ["weight_decay=0.01", "betas=0.9,0.99"]
+        warmup_steps = min(ADAMW_WARMUP_STEPS, int(max_steps) // 10)
 
     training_config = {
         "pretrained_model_name_or_path": Path(models["dit_path"]).resolve().as_posix(),
         "qwen3": Path(models["qwen_path"]).resolve().as_posix(),
         "vae": Path(models["vae_path"]).resolve().as_posix(),
         "network_module": HIDDEN_SETTINGS["network_module"],
+        "network_args": HIDDEN_SETTINGS["network_args"],
         "network_dim": int(rank),
         "network_alpha": network_alpha,
         "network_train_unet_only": HIDDEN_SETTINGS["network_train_unet_only"],
@@ -309,6 +341,7 @@ def create_training_toml(project_name, config_save_dir, actual_output_dir, rank,
         "optimizer_type": optimizer,
         "optimizer_args": opt_args,
         "lr_scheduler": scheduler,
+        "lr_warmup_steps": warmup_steps,
         "max_train_steps": int(max_steps),
         "train_batch_size": int(batch_size),
         "gradient_accumulation_steps": int(grad_acc),
@@ -552,106 +585,49 @@ def run_smart_crop_ui(dataset_dir: str, side_min: float, side_max: float, curren
 
 
 # ==========================================
-# TAGGER CLASS (WD14)
+# TAGGER (animetimm dbv4-huge)
 # ==========================================
-class WDTagger:
-    def __init__(self):
-        self.model = None
-        self.tag_names = []
-        self.general_indexes = []
-        self.character_indexes = []
-        self.target_size = 448
-        self.model_dir = ROOT / "models" / "wd-eva02-large-tagger-v3"
-        self.model_path = self.model_dir / "model.onnx"
-        self.csv_path = self.model_dir / "selected_tags.csv"
-        self.kaomojis = ["0_0", "(o)_(o)", "+_+", "+_-", "._.", "<o>_<o>", "<|>_<|>", "=_=", ">_<", "3_3", "6_9", ">_o", "@_@", "^_^", "o_o", "u_u", "x_x", "|_|", "||_||"]
+# Optional offline copy of the model repo; when it is not there the model comes
+# from the Hugging Face cache (downloaded on first use).
+TAGGER_LOCAL_DIR = ROOT / "models" / "convnextv2_huge.dbv4-full"
+# Images per forward pass. ConvNeXtV2-huge at 512px in bf16 stays well inside
+# 6 GB with 4; decoding runs in parallel threads meanwhile.
+TAGGER_BATCH = 4
 
-    def load_model(self):
-        if self.model is not None:
-            return "Already loaded"
-            
-        if not self.model_path.exists() or not self.csv_path.exists():
-            raise FileNotFoundError(f"Model or CSV not found in {self.model_dir}.")
+db_tagger = DbTagger(TAGGER_LOCAL_DIR)
+aesthetic_scorer = AestheticScorer()
 
-        df = pd.read_csv(self.csv_path)
-        name_series = df["name"].map(lambda x: str(x).replace("_", " ") if pd.notna(x) and str(x) not in self.kaomojis else str(x))
-        self.tag_names = name_series.tolist()
-        self.general_indexes = list(np.where(df["category"] == 0)[0])
-        self.character_indexes = list(np.where(df["category"] == 4)[0])
 
-        providers = [
-            ('CUDAExecutionProvider', {
-                'device_id': 0,
-                'arena_extend_strategy': 'kNextPowerOfTwo',
-                'cudnn_conv_algo_search': 'EXHAUSTIVE',
-                'do_copy_in_default_stream': True,
-            }),
-            'CPUExecutionProvider',
-        ]
-        
-        self.model = rt.InferenceSession(str(self.model_path), providers=providers)
-        current_provider = self.model.get_providers()[0]
-        return "GPU (CUDA)" if "CUDA" in current_provider else "CPU (Slow Mode)"
+def _replace_progress(log_lines, prefix, msg):
+    """Keep a single, updating progress line in the log box."""
+    if log_lines and log_lines[-1].startswith(prefix): log_lines[-1] = msg
+    else: log_lines.append(msg)
 
-    def preprocess(self, image):
-        canvas = Image.new("RGBA", image.size, (255, 255, 255))
-        canvas.alpha_composite(image.convert("RGBA"))
-        image = canvas.convert("RGB")
-        max_dim = max(image.size)
-        pad_left = (max_dim - image.size[0]) // 2
-        pad_top = (max_dim - image.size[1]) // 2
-        padded_image = Image.new("RGB", (max_dim, max_dim), (255, 255, 255))
-        padded_image.paste(image, (pad_left, pad_top))
-        if max_dim != self.target_size:
-            padded_image = padded_image.resize((self.target_size, self.target_size), Image.BICUBIC)
-        image_array = np.asarray(padded_image, dtype=np.float32)
-        image_array = image_array[:, :, ::-1] # BGR
-        return np.expand_dims(image_array, axis=0)
 
-    def predict(self, image, gen_thresh, char_thresh):
-        image_array = self.preprocess(image)
-        input_name = self.model.get_inputs()[0].name
-        outputs = self.model.run(None, {input_name: image_array})
-        preds = outputs[0][0]
-        
-        general_tags = [self.tag_names[i] for i in self.general_indexes if i < len(preds) and preds[i] > gen_thresh]
-        char_tags = [self.tag_names[i] for i in self.character_indexes if i < len(preds) and preds[i] > char_thresh]
-        
-        char_tags = [char.replace("(", r"\(").replace(")", r"\)") for char in char_tags]
-        general_tags = sorted(general_tags, key=lambda x: preds[self.tag_names.index(x)], reverse=True)
-        
-        final_list = []
-        if char_tags: final_list.append(", ".join(char_tags))
-        if general_tags: final_list.append(", ".join(general_tags).replace("(", r"\(").replace(")", r"\)"))
-        return ", ".join(final_list)
-
-    def unload_model(self):
-        import gc
-        import torch
-        if self.model is not None:
-            del self.model
-            self.model = None
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()    
-
-wd_tagger = WDTagger()
+def _explain_model_error(exc: Exception) -> str:
+    text = f"{type(exc).__name__}: {exc}"
+    if any(s in text for s in ("Gated", "gated", "401", "403", "RepositoryNotFound")):
+        text += ("\n   The tagger repo needs a Hugging Face login: accept the terms at "
+                 "https://huggingface.co/animetimm/convnextv2_huge.dbv4-full, then run "
+                 "`uv run hf auth login` (or copy the repo files into models/convnextv2_huge.dbv4-full).")
+    if isinstance(exc, ImportError):
+        text += "\n   Missing packages: run Install_Requirements.bat (uv sync)."
+    return text
 
 # ==========================================
 # GUI EXECUTOR FUNCTIONS
 # ==========================================
 
-def run_auto_tagging(dataset_dir, gen_thresh, char_thresh, overwrite, current_logs):
+def run_auto_tagging(dataset_dir, gen_floor, char_floor, blacklist_text, add_safety, overwrite, current_logs):
     log_lines = current_logs.split('\n') if current_logs else []
-    
+
     if not dataset_dir or not os.path.exists(dataset_dir):
         log_lines.append("❌ Tagger Error: Dataset path invalid!")
         yield "\n".join(log_lines)
         return
 
-    valid_exts = {'.png', '.jpg', '.jpeg', '.webp'}
-    all_files = [f for f in Path(dataset_dir).glob('*') if f.is_file() and f.suffix.lower() in valid_exts]
-    
+    all_files = list_images(Path(dataset_dir))
+
     image_files = []
     skipped = 0
     for f in all_files:
@@ -664,60 +640,199 @@ def run_auto_tagging(dataset_dir, gen_thresh, char_thresh, overwrite, current_lo
         log_lines.append("❌ Tagger Error: No images found!")
         yield "\n".join(log_lines)
         return
-        
+
     if not image_files and skipped > 0:
         log_lines.append(f"ℹ️ All images already have captions. Skipped: {skipped}")
         yield "\n".join(log_lines)
         return
 
-    log_lines.append(f"🏷️ Initializing WD-Tagger (Multi-threaded)...")
+    blacklist = TagBlacklist(blacklist_text)
+    log_lines.append("🏷️ Loading tagger animetimm/convnextv2_huge.dbv4-full...")
+    if blacklist:
+        log_lines.append(f"🚫 Never-apply list: {', '.join(blacklist.patterns)}")
     yield "\n".join(log_lines)
-    
+
     try:
-        mode = wd_tagger.load_model()
+        mode = db_tagger.load()
         log_lines.append(f"🚀 Model loaded using: {mode}")
-        log_lines.append(f"⚙️ Processing {len(image_files)} images in 4 threads... (Skipped: {skipped})")
+        log_lines.append(f"⚙️ Processing {len(image_files)} images... (Skipped: {skipped})")
         yield "\n".join(log_lines)
 
         processed_count = 0
+        blocked_count = 0
         total_to_process = len(image_files)
-        lock = threading.Lock()
+        batches = [image_files[i:i + TAGGER_BATCH] for i in range(0, total_to_process, TAGGER_BATCH)]
 
-        def process_single_image(img_path):
-            nonlocal processed_count
-            try:
-                with Image.open(img_path) as img:
-                    tags = wd_tagger.predict(img, gen_thresh, char_thresh)
-                with open(img_path.with_suffix('.txt'), 'w', encoding='utf-8') as f:
-                    f.write(tags)
-                with lock:
-                    processed_count += 1
-                return None
-            except Exception as e:
-                return f"⚠️ Error {img_path.name}: {str(e)}"
-
+        # Decoding/preprocessing runs in threads one batch ahead of the GPU.
         with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = [executor.submit(process_single_image, path) for path in image_files]
-            
-            for future in as_completed(futures):
-                error_msg = future.result()
-                if error_msg: log_lines.append(error_msg)
-                
-                if processed_count % 5 == 0 or processed_count == total_to_process:
-                    msg = f"🔄 Tag Progress: {processed_count}/{total_to_process} images."
-                    if "Tag Progress:" in log_lines[-1]: log_lines[-1] = msg
-                    else: log_lines.append(msg)
-                    yield "\n".join(log_lines)
+            pending = [executor.submit(db_tagger.prepare, p) for p in batches[0]]
+            for b, batch in enumerate(batches):
+                current = pending
+                pending = [executor.submit(db_tagger.prepare, p) for p in batches[b + 1]] if b + 1 < len(batches) else []
+
+                ready_paths, tensors = [], []
+                for img_path, future in zip(batch, current):
+                    try:
+                        tensors.append(future.result())
+                        ready_paths.append(img_path)
+                    except Exception as e:
+                        log_lines.append(f"⚠️ Error {img_path.name}: {str(e)}")
+
+                if tensors:
+                    try:
+                        probs = db_tagger.predict(tensors)
+                    except Exception as e:
+                        log_lines.append(f"⚠️ Error in batch ({', '.join(p.name for p in ready_paths)}): {str(e)}")
+                        probs = []
+                    for img_path, p in zip(ready_paths, probs):
+                        caption, blocked = db_tagger.caption(p, gen_floor, char_floor, add_safety, blacklist)
+                        blocked_count += blocked
+                        with open(img_path.with_suffix('.txt'), 'w', encoding='utf-8') as f:
+                            f.write(caption)
+                        processed_count += 1
+
+                _replace_progress(log_lines, "🔄 Tag Progress:", f"🔄 Tag Progress: {processed_count}/{total_to_process} images.")
+                yield "\n".join(log_lines)
 
         log_lines.append(f"✅ Tagging complete! Processed: {processed_count} | Skipped: {skipped}")
-        
+        if blocked_count:
+            log_lines.append(f"🚫 Left out {blocked_count} tag(s) from the never-apply list.")
+
     except Exception as e:
-        log_lines.append(f"❌ Critical Tagger Error: {str(e)}")
-        
+        log_lines.append(f"❌ Critical Tagger Error: {_explain_model_error(e)}")
+
     finally:
-        wd_tagger.unload_model()
+        db_tagger.unload()
         log_lines.append("🧹 VRAM cleared.")
         yield "\n".join(log_lines)
+
+
+# ==========================================
+# AESTHETIC QUALITY FILTER
+# ==========================================
+def _drive(steps, render):
+    """Runs a step generator, yielding render() after every step; returns the
+    generator's return value (lets the UI tools and Start Training share it)."""
+    while True:
+        try:
+            next(steps)
+        except StopIteration as stop:
+            return stop.value
+        yield render()
+
+
+def apply_quality_filter(dataset_dir: Path, images: List[Path], keep_labels, mode: str,
+                         log_lines: List[str], always_score: bool = False):
+    """Step generator. Scores the images (cached in aesthetic_scores.json), then
+    ignores or moves the ones whose label is not in keep_labels.
+
+    Returns the images left to train on, or None if the selection is invalid.
+    """
+    keep = [label for label in QUALITY_LABELS if label in (keep_labels or [])]
+    filtering = mode in (QUALITY_MODE_IGNORE, QUALITY_MODE_MOVE) and len(keep) < len(QUALITY_LABELS)
+    if mode != QUALITY_MODE_OFF and not keep:
+        log_lines.append("❌ Quality filter: select at least one label to keep.")
+        yield
+        return None
+    if not filtering and not always_score:
+        return images
+
+    cache = ScoreCache(dataset_dir)
+    missing = [p for p in images if cache.get(p) is None]
+    if missing:
+        log_lines.append(f"🎨 Aesthetic scoring {len(missing)} image(s) (deepghs anime_aesthetic; {len(images) - len(missing)} cached)...")
+        yield
+        try:
+            aesthetic_scorer.load()
+            for i, img_path in enumerate(missing, 1):
+                try:
+                    cache.put(img_path, aesthetic_scorer.percentile(img_path))
+                except Exception as e:
+                    log_lines.append(f"⚠️ {img_path.name}: {e}")
+                if i % 5 == 0 or i == len(missing):
+                    _replace_progress(log_lines, "🔄 Score Progress:", f"🔄 Score Progress: {i}/{len(missing)} images.")
+                    yield
+        except Exception as e:
+            log_lines.append(f"❌ Aesthetic model error: {_explain_model_error(e)}")
+            yield
+            return None
+        finally:
+            aesthetic_scorer.unload()
+            cache.save()
+
+    labels = {}
+    for p in images:
+        percentile = cache.get(p)
+        if percentile is not None:
+            labels[p] = percentile_to_label(percentile)
+
+    counts = {label: 0 for label in QUALITY_LABELS}
+    for label in labels.values():
+        counts[label] += 1
+    log_lines.append("📊 Aesthetic labels (percentile on Danbooru's score distribution):")
+    for label in QUALITY_LABELS:
+        mark = "✓" if label in keep else "✗"
+        log_lines.append(f"  {mark} {label:<11} >= {QUALITY_FLOORS[label]:.2f}: {counts[label]} images")
+    unscored = [p for p in images if p not in labels]
+    if unscored:
+        log_lines.append(f"⚠️ {len(unscored)} image(s) could not be scored and are kept.")
+
+    rejected = [p for p in images if p in labels and labels[p] not in keep]
+    kept = [p for p in images if p not in rejected]
+    if not filtering:
+        log_lines.append("ℹ️ Filter is Off: nothing ignored or moved.")
+    elif not rejected:
+        log_lines.append(f"✅ All {len(images)} images are within the selected labels.")
+    elif mode == QUALITY_MODE_MOVE:
+        moved_files = 0
+        for p in rejected:
+            try:
+                moved_files += move_out_of_dataset(dataset_dir, p, labels[p])
+            except Exception as e:
+                log_lines.append(f"⚠️ Could not move {p.name}: {e}")
+                kept.append(p)
+        kept = sorted(kept)
+        log_lines.append(f"📦 Moved {len(images) - len(kept)} image(s) out of the dataset ({moved_files} files "
+                         f"with captions/originals) to {dataset_dir / FILTERED_DIR}")
+    else:
+        log_lines.append(f"🙈 {len(rejected)} image(s) outside the selected labels will be ignored in training "
+                         f"({len(kept)} left).")
+    yield
+    return kept
+
+
+def run_quality_filter_ui(dataset_dir, keep_labels, mode, current_logs):
+    log_lines = current_logs.split('\n') if current_logs else []
+    if not dataset_dir or not os.path.isdir(dataset_dir):
+        log_lines.append("❌ Error: Dataset path invalid!")
+        yield "\n".join(log_lines)
+        return
+    images = list_images(Path(dataset_dir))
+    if not images:
+        log_lines.append("❌ Error: No images found in the dataset path.")
+        yield "\n".join(log_lines)
+        return
+    yield from _drive(
+        apply_quality_filter(Path(dataset_dir), images, keep_labels, mode, log_lines, always_score=True),
+        lambda: "\n".join(log_lines),
+    )
+    yield "\n".join(log_lines)
+
+
+def restore_quality_filter_ui(dataset_dir, current_logs):
+    log_lines = current_logs.split('\n') if current_logs else []
+    if not dataset_dir or not os.path.isdir(dataset_dir):
+        log_lines.append("❌ Error: Dataset path invalid!")
+        return "\n".join(log_lines)
+    restored, conflicts = restore_moved(Path(dataset_dir))
+    if restored or conflicts:
+        log_lines.append(f"↩️ Restored {restored} file(s) from {FILTERED_DIR} to the dataset.")
+    else:
+        log_lines.append("ℹ️ Nothing to restore.")
+    if conflicts:
+        log_lines.append(f"⚠️ Left {len(conflicts)} file(s) in {FILTERED_DIR}: a file with the same name is back "
+                         f"in its place ({', '.join(conflicts[:5])}).")
+    return "\n".join(log_lines)
 
 
 def open_dataset_folder_ui(dataset_dir, current_logs):
@@ -957,7 +1072,7 @@ def _shutdown_training_session():
 # TRAINING FUNCTIONS
 # ==========================================
 
-def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, optimizer, t_steps, save_steps, sample_steps, pos, neg, w, h, s_steps_gen, s_cfg, s_seed, train_seed, batch_size, grad_acc):
+def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, optimizer, t_steps, save_steps, sample_steps, pos, neg, w, h, s_steps_gen, s_cfg, s_seed, train_seed, batch_size, grad_acc, blacklist_text, quality_keep, quality_mode):
     global TRAIN_SESSION
 
     # Re-attach FIRST: the page may have been reloaded while a run is going on, and
@@ -986,34 +1101,13 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
     if not vae_p or not os.path.isfile(vae_p): model_errors.append(f"❌ VAE file not found: {vae_p}")
     
     dataset_errors = []
-    if not dataset_path or not os.path.exists(dataset_path): 
+    image_files = []
+    if not dataset_path or not os.path.isdir(dataset_path):
         dataset_errors.append(f"❌ Dataset path not found: {dataset_path}")
     else:
-        valid_exts = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
-        dataset_path_obj = Path(dataset_path)
-        image_files = [f for f in dataset_path_obj.glob('*') if f.is_file() and f.suffix.lower() in valid_exts]
-        
+        image_files = list_images(Path(dataset_path))
         if not image_files:
             dataset_errors.append(f"❌ No valid images found in the dataset path.")
-        else:
-            # Check for missing text files (captions)
-            missing_captions = [img.name for img in image_files if not img.with_suffix('.txt').exists()]
-            if missing_captions:
-                dataset_errors.append(f"❌ Error: Found {len(missing_captions)} images without .txt captions. Please use the 'Auto-Caption Dataset' tool first.")
-            
-            # Check for oversized images
-            oversized_images = []
-            for img_path in image_files:
-                try:
-                    with Image.open(img_path) as img:
-                        w_img, h_img = img.size
-                        if w_img >= 2048 or h_img >= 2048:
-                            oversized_images.append(img.name)
-                except Exception:
-                    pass
-            
-            if oversized_images:
-                dataset_errors.append(f"❌ Error: Found {len(oversized_images)} images that are too large (>= 2048px). Please use the 'Smart Aspect Ratio Bucketing' tool to resize them before training.")
 
     if model_errors or dataset_errors:
         full_error = ""
@@ -1037,7 +1131,36 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
         yield cuda_error, gr.update()
         return
 
-    project_name = re.sub(r'[^a-zA-Z0-9]', '_', trigger_word.strip()).strip('_') or "untitled"
+    trigger = trigger_word.strip()
+    project_name = re.sub(r'[^a-zA-Z0-9]', '_', trigger).strip('_') or "untitled"
+    dataset_dir = Path(dataset_path)
+
+    log_lines = [f"🚀 Preparing: {project_name}..."]
+    render = lambda: ("\n".join(log_lines), gr.update())
+
+    yield render()
+
+    # 1. Aesthetic quality filter (no-op when Off)
+    image_files = yield from _drive(
+        apply_quality_filter(dataset_dir, image_files, quality_keep, quality_mode, log_lines), render)
+    if image_files is None:
+        yield render()
+        return
+    if not image_files:
+        log_lines.append("❌ No images left to train on after the quality filter.")
+        yield render()
+        return
+
+    # 2. Captions and sizes of exactly the images that will be trained
+    log_lines.append(f"🔍 Analyzing {len(image_files)} dataset images...")
+    yield render()
+    blacklist = TagBlacklist(blacklist_text)
+    report = collect_training_entries(image_files, trigger, blacklist)
+    if report.errors:
+        log_lines.extend(report.errors)
+        yield render()
+        return
+    entries = report.entries
 
     project_out_dir = OUTPUT_BASE / project_name
     sample_dir = project_out_dir / "sample"
@@ -1046,32 +1169,50 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
     for d in [project_out_dir, sample_dir, project_configs_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
-    log_lines = [f"🚀 Preparing: {project_name}..."]
-
-    yield "\n".join(log_lines), gr.update()
-
     # A leftover trainer from a killed run keeps VRAM busy and makes the new run
     # freeze or crawl, so clean the GPU before starting.
     strays = find_stray_trainers()
     if strays:
         pids = ", ".join(str(p.pid) for p in strays)
         log_lines.append(f"🧹 Killing leftover trainer process(es) from a previous run: {pids}")
-        yield "\n".join(log_lines), gr.update()
+        yield render()
         for stray in strays:
             _kill_process_tree(stray.pid)
         time.sleep(3)
 
-    log_lines.append(f"🔍 Analyzing dataset images...")
-    base_res, max_bucket = analyze_dataset_resolution(dataset_path)
+    base_res, max_bucket = analyze_dataset_resolution([e.size for e in entries])
     log_lines.append(f"📐 Auto-Resolution Set: Base {base_res}px, Max Bucket {max_bucket}px")
+
+    # 3. The captions sd-scripts will encode: "<trigger>, <tags>"
+    metadata_path = project_configs_dir / f"{project_name}_captions.json"
+    write_caption_metadata(metadata_path, entries, trigger)
+    log_lines.append(f"📝 Captions for {len(entries)} images"
+                     + (f", trigger '{trigger}' first" if trigger else " (no trigger word)")
+                     + f" -> {metadata_path.name}")
+    if report.blacklisted:
+        log_lines.append(f"🚫 Removed {report.blacklisted} tag(s) of the never-apply list from the captions.")
+    if report.empty:
+        log_lines.append(f"⚠️ {len(report.empty)} caption(s) are empty" + (" (trigger word only)." if trigger else "."))
+
+    # 4. Drop cached text encoder outputs / latents that no longer match
+    te_fingerprint = f"qwen={model_fingerprint(qwen_p)}|dropout={HIDDEN_SETTINGS['caption_dropout_rate']}|v1"
+    latent_fingerprint = f"vae={model_fingerprint(vae_p)}|v1"
+    try:
+        te_dropped, latent_dropped = refresh_disk_caches(
+            dataset_dir, {e.image: join_caption(trigger, e.tags) for e in entries}, te_fingerprint, latent_fingerprint)
+        if te_dropped or latent_dropped:
+            log_lines.append(f"♻️ Captions/images changed since the last cache: re-encoding {te_dropped} caption(s)"
+                             f" and {latent_dropped} latent(s).")
+    except Exception as e:
+        log_lines.append(f"⚠️ Could not check the disk caches ({e}); delete the cache_text_encoder folder by hand if captions changed.")
 
     models = {"dit_path": dit_p, "qwen_path": qwen_p, "vae_path": vae_p}
     prompt_path = create_sample_prompts(project_name, trigger_word, pos, neg, w, h, s_steps_gen, s_cfg, s_seed, project_configs_dir)
-    dataset_toml = create_dataset_toml(project_name, dataset_path, trigger_word, base_res, max_bucket, project_configs_dir, t_steps, batch_size, grad_acc)
+    dataset_toml = create_dataset_toml(project_name, dataset_path, metadata_path, len(entries), base_res, max_bucket, project_configs_dir, t_steps, batch_size, grad_acc)
     training_toml = create_training_toml(project_name, project_configs_dir, project_out_dir, rank, lr, optimizer, t_steps, save_steps, sample_steps, models, prompt_path, train_seed, batch_size, grad_acc)
 
     cmd = [
-        str(PORTABLE_PYTHON.resolve()), "-m", "accelerate.commands.launch", "--num_processes=1", "--mixed_precision=bf16", "--dynamo_backend=no",
+        str(PYTHON_EXE), "-m", "accelerate.commands.launch", "--num_processes=1", "--mixed_precision=bf16", "--dynamo_backend=no",
         TRAIN_SCRIPT.resolve().as_posix(), 
         "--config_file", Path(training_toml).resolve().as_posix(), 
         "--dataset_config", Path(dataset_toml).resolve().as_posix()
@@ -1163,7 +1304,7 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
         elem_id="main-header"
     )
     
-    saved_adam_lr = gr.State(value="0.00005")
+    saved_adam_lr = gr.State(value=ADAMW_DEFAULT_LR)
 
     with gr.Group():
         with gr.Row():
@@ -1182,8 +1323,8 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
             with gr.Column(scale=1):
                 with gr.Row():
                     rank_input = gr.Number(label="Network Rank", value=cs.get("network_rank", 16), precision=0)
-                    lr_input = gr.Textbox(label="Learning Rate", value=cs.get("learning_rate", "1.0"))
-                    optimizer_input = gr.Dropdown(label="Optimizer", choices=["Prodigy", "AdamW8bit", "AdamW"], value=cs.get("optimizer", "Prodigy"))
+                    lr_input = gr.Textbox(label="Learning Rate", value=cs.get("learning_rate", ADAMW_DEFAULT_LR))
+                    optimizer_input = gr.Dropdown(label="Optimizer", choices=["AdamW8bit", "AdamW", "Prodigy"], value=cs.get("optimizer", "AdamW8bit"))
                     train_seed_val = gr.Number(value=cs.get("train_seed", 42), visible=False)
                     batch_size_input = gr.Number(label="Batch Size", value=cs.get("train_batch_size", 1), precision=0)
                 with gr.Row():
@@ -1207,19 +1348,26 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
                     
             # --- AUTO CAPTION ---
             with gr.Group():
-                gr.Markdown("### Auto-Caption Dataset")
+                gr.Markdown("### Auto-Caption Dataset (animetimm dbv4-huge)")
                 with gr.Row():
-                    tagger_gen_thresh = gr.Slider(0.0, 1.0, value=cs.get("tagger_gen_thresh", 0.35), step=0.01, label="General Tags Threshold")
-                    tagger_char_thresh = gr.Slider(0.0, 1.0, value=cs.get("tagger_char_thresh", 0.85), step=0.01, label="Character Tags Threshold")
+                    tagger_gen_floor = gr.Slider(0.0, 1.0, value=cs.get("tagger_gen_floor", 0.0), step=0.01, label="General Tags: Min Confidence",
+                                                 info="0 = the model's calibrated threshold of each tag")
+                    tagger_char_floor = gr.Slider(0.0, 1.0, value=cs.get("tagger_char_floor", CHARACTER_FLOOR_DEFAULT), step=0.01, label="Character Tags: Min Confidence",
+                                                  info="On top of the calibrated threshold")
+                tagger_blacklist = gr.Textbox(label="Never Apply These Tags", lines=2, value=cs.get("tagger_blacklist", ""),
+                                              placeholder="e.g. signature, watermark, artist name, *username, simple background",
+                                              info="Comma separated, * = wildcard. Left out when tagging and removed from existing captions when training.")
                 with gr.Row():
-                    tagger_btn = gr.Button("Create .txt captions", variant="secondary")        
-                    tagger_overwrite = gr.Checkbox(label="Overwrite existing .txt", value=cs.get("tagger_overwrite", False)) 
-                
-                
+                    tagger_btn = gr.Button("Create .txt captions", variant="secondary")
+                    tagger_overwrite = gr.Checkbox(label="Overwrite existing .txt", value=cs.get("tagger_overwrite", False))
+                    tagger_add_safety = gr.Checkbox(label="Add safety tag (safe/sensitive/nsfw/explicit)", value=cs.get("tagger_add_safety", True))
+
+
         with gr.Column(scale=1):
             preview_gallery = gr.Gallery(label="Previews", columns=2, rows=2, height=GALLERY_HEIGHT, object_fit="contain")
             with gr.Group():
-                pos_prompt = gr.Textbox(label="Prompt (Trigger word added automatically)", lines=2, value=cs.get("pos_prompt", ""))
+                pos_prompt = gr.Textbox(label="Prompt (Trigger word added automatically)", lines=2, value=cs.get("pos_prompt", ""),
+                                        placeholder="e.g. masterpiece, best quality, score_7, safe, 1girl, solo, upper body")
                 neg_prompt = gr.Textbox(label="Negative Prompt", lines=1, value=cs.get("neg_prompt", ""))
                 with gr.Row():
                     width_input = gr.Number(label="Width", value=cs.get("width", 1024), precision=0, min_width=80)
@@ -1228,23 +1376,53 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
                     sample_cfg_input = gr.Number(label="CFG", value=cs.get("sample_cfg", 4.0), min_width=80)
                     sample_seed_input = gr.Number(label="Seed", value=cs.get("sample_seed", 42), precision=0, min_width=80)
 
+            # --- AESTHETIC QUALITY FILTER ---
+            with gr.Group():
+                gr.Markdown("### Aesthetic Quality Filter (deepghs anime_aesthetic)")
+                quality_keep = gr.CheckboxGroup(
+                    choices=QUALITY_LABELS, value=cs.get("quality_keep", list(QUALITY_LABELS)), label="Keep images rated",
+                    info="Percentile on Danbooru's score distribution: masterpiece ≥ 95%, best ≥ 85%, great ≥ 75%, "
+                         "good ≥ 50%, normal ≥ 25%, low ≥ 10%, worst < 10%")
+                quality_mode = gr.Radio(
+                    choices=QUALITY_MODES, value=cs.get("quality_mode", QUALITY_MODE_OFF), label="Images outside the selection",
+                    info=f"Applied when training starts. 'Move' puts them in the dataset's {FILTERED_DIR} folder (not trained, can be restored).")
+                with gr.Row():
+                    quality_btn = gr.Button("📊 Score & Apply Now", variant="secondary")
+                    quality_restore_btn = gr.Button("↩️ Restore Moved Images", variant="secondary")
+
     training_inputs = [
         trigger_word, dataset_path, dit_input, qwen_input, vae_input,
-        rank_input, lr_input, optimizer_input, 
+        rank_input, lr_input, optimizer_input,
         steps_input, save_steps_input, sample_steps_input,
         pos_prompt, neg_prompt, width_input, height_input,
-        sample_steps_gen_input, sample_cfg_input, sample_seed_input, train_seed_val, batch_size_input, grad_acc_input
+        sample_steps_gen_input, sample_cfg_input, sample_seed_input, train_seed_val, batch_size_input, grad_acc_input,
+        tagger_blacklist, quality_keep, quality_mode,
     ]
 
-    all_settings_list = training_inputs + [
-        side_min_input, side_max_input, tagger_gen_thresh, tagger_char_thresh, tagger_overwrite
-    ]
+    # Every persisted setting, by its key in settings.json. auto_save_state and
+    # load_state_on_refresh pair values with keys by position, so the list is
+    # built from DEFAULT_SETTINGS' order and checked against it.
+    SETTINGS_COMPONENTS = {
+        "trigger_word": trigger_word, "dataset_path": dataset_path,
+        "dit_path": dit_input, "qwen_path": qwen_input, "vae_path": vae_input,
+        "network_rank": rank_input, "learning_rate": lr_input, "optimizer": optimizer_input,
+        "training_steps": steps_input, "save_steps": save_steps_input, "sample_steps": sample_steps_input,
+        "pos_prompt": pos_prompt, "neg_prompt": neg_prompt, "width": width_input, "height": height_input,
+        "sample_steps_gen": sample_steps_gen_input, "sample_cfg": sample_cfg_input, "sample_seed": sample_seed_input,
+        "train_seed": train_seed_val, "train_batch_size": batch_size_input, "gradient_accumulation_steps": grad_acc_input,
+        "side_min": side_min_input, "side_max": side_max_input,
+        "tagger_gen_floor": tagger_gen_floor, "tagger_char_floor": tagger_char_floor,
+        "tagger_blacklist": tagger_blacklist, "tagger_add_safety": tagger_add_safety, "tagger_overwrite": tagger_overwrite,
+        "quality_keep": quality_keep, "quality_mode": quality_mode,
+    }
+    assert set(SETTINGS_COMPONENTS) == set(DEFAULT_SETTINGS), "SETTINGS_COMPONENTS and DEFAULT_SETTINGS differ"
+    all_settings_list = [SETTINGS_COMPONENTS[k] for k in DEFAULT_SETTINGS]
 
     def load_state_on_refresh():
         current_settings = load_settings()
         return [current_settings.get(k, DEFAULT_SETTINGS[k]) for k in DEFAULT_SETTINGS.keys()]
 
-    ui.load(fn=load_state_on_refresh, inputs=None, outputs=all_settings_list)    
+    ui.load(fn=load_state_on_refresh, inputs=None, outputs=all_settings_list)
 
     output_log.change(None, None, None, js=JS_SCROLL)
     optimizer_input.change(fn=handle_optimizer_change, inputs=[optimizer_input, lr_input, saved_adam_lr], outputs=[lr_input, saved_adam_lr])
@@ -1266,10 +1444,21 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
     
     tagger_btn.click(
         fn=run_auto_tagging,
-        inputs=[dataset_path, tagger_gen_thresh, tagger_char_thresh, tagger_overwrite, output_log],
+        inputs=[dataset_path, tagger_gen_floor, tagger_char_floor, tagger_blacklist, tagger_add_safety, tagger_overwrite, output_log],
         outputs=[output_log]
     )
-    
+
+    quality_btn.click(
+        fn=run_quality_filter_ui,
+        inputs=[dataset_path, quality_keep, quality_mode, output_log],
+        outputs=[output_log]
+    )
+    quality_restore_btn.click(
+        fn=restore_quality_filter_ui,
+        inputs=[dataset_path, output_log],
+        outputs=[output_log]
+    )
+
     start_btn.click(fn=start_training, inputs=training_inputs, outputs=[output_log, preview_gallery])
     stop_btn.click(fn=stop_training, outputs=output_log)
     folder_btn.click(fn=open_output_folder, inputs=[trigger_word], outputs=output_log)

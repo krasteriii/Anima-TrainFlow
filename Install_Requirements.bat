@@ -2,25 +2,26 @@
 setlocal
 cd /d %~dp0
 
-if not exist "python_embeded\python.exe" (
-    echo [ERROR] python_embeded folder not found!
+where uv >nul 2>nul
+if errorlevel 1 (
+    echo [ERROR] uv is not installed. Install it with:
+    echo.
+    echo     powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+    echo.
+    echo then open a new terminal and run this file again.
     pause
-    exit
+    exit /b 1
 )
 
-set "PY_EXE=%~dp0python_embeded\python.exe"
-
-echo [1/3] Installing PyTorch (CUDA 12.8)...
-"%PY_EXE%" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-
-echo [2/3] Installing Dependencies from sd-scripts...
-cd /d "%~dp0training\sd-scripts"
-"%PY_EXE%" -m pip install -r requirements.txt
-
-echo [3/3] Linking sd-scripts library...
-"%PY_EXE%" -m pip install -e .
-
-cd /d %~dp0
+echo Installing Python 3.10 + PyTorch ^(CUDA 12.8^) + sd-scripts dependencies into .venv ...
+echo ^(versions pinned in uv.lock; already downloaded packages come from the uv cache^)
+uv sync
+if errorlevel 1 (
+    echo.
+    echo [ERROR] uv sync failed. Check the message above.
+    pause
+    exit /b 1
+)
 
 echo.
 echo Installation Complete!

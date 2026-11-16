@@ -1,0 +1,58 @@
+[project]
+name = "anima-trainflow"
+version = "1.2.0"
+description = "One-page LoRA trainer for Anima (sd-scripts backend) with auto-captioning and an aesthetic quality filter."
+readme = "README.md"
+# numpy<2 (required by dghs-imgutils) has no wheels for Python 3.13+.
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    # PyTorch with CUDA 12.8 (see [tool.uv.sources])
+    "torch>=2.6",
+    "torchvision",
+
+    # sd-scripts (training/sd-scripts/requirements.txt). sd-scripts itself is
+    # not installed: the app runs it from its folder with PYTHONPATH set.
+    "accelerate==1.6.0",
+    "transformers>=4.54.1,<5",
+    "diffusers[torch]==0.32.1",
+    "ftfy==6.3.1",
+    "einops==0.7.0",
+    "bitsandbytes",
+    "lion-pytorch==0.2.3",
+    "schedulefree==1.4",
+    "pytorch-optimizer==3.10.0",
+    "prodigy-plus-schedule-free==1.9.2",
+    "prodigyopt==1.1.2",
+    "tensorboard",
+    "safetensors==0.4.5",
+    "toml==0.10.2",
+    "voluptuous==0.15.2",
+    "huggingface-hub==0.34.3",
+    "imagesize==1.4.1",
+    "rich==14.1.0",
+    "sentencepiece==0.2.1",
+
+    # UI and dataset tools
+    "gradio==6.14.0",
+    "onnxruntime-gpu==1.23.2",  # U2Net smart crop + aesthetic model
+    # Same cv2 as sd-scripts' opencv-python pin, in the contrib build that
+    # dghs-imgutils requires (having both installed makes them overwrite each other).
+    "opencv-contrib-python==4.10.0.84",
+    "numpy<2",
+    "pillow",
+    "psutil",
+    "timm>=1.0.27",             # animetimm dbv4 tagger ("local-dir:" loading)
+    "dghs-imgutils>=0.19",      # tagger preprocessing + deepghs anime_aesthetic
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

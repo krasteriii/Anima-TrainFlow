@@ -4,6 +4,13 @@
 # Python
 __pycache__/
 *.py[cod]
+.venv/
+
+# Model files placed in models/ (only the placeholders are tracked)
+/models/**/*.onnx
+/models/**/*.safetensors
+/models/**/*.csv
+/models/**/*.json
 
 # Runtime artifacts produced by the app / trainer
 /training/output/
